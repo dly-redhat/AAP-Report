@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+{# Rows come from lightspeed_report.yml: one per host in the Lightspeed inventory. #}
+{% set rows = lightspeed_report_rows | sort(attribute='host') %}
+{% set with_data = rows | selectattr('found') | list %}
+{% set no_data = rows | rejectattr('found') | list %}
+{% set ns = namespace(critical=0, important=0, exploit=0, fixable=0, at_risk=0) %}
+{% for r in with_data %}
+{%   set ns.critical = ns.critical + r.critical %}
+{%   set ns.important = ns.important + r.important %}
+{%   set ns.exploit = ns.exploit + r.known_exploit %}
+{%   set ns.fixable = ns.fixable + r.fixable %}
+{%   if r.critical > 0 or r.known_exploit > 0 %}{% set ns.at_risk = ns.at_risk + 1 %}{% endif %}
+{% endfor %}
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ lightspeed_report_title | e }}</title>
+<style>
+  :root { --ink:#151515; --muted:#6a6e73; --line:#e4e6e9; --bg:#f5f6f8; --card:#fff;
+          --bad:#a30000; --warn:#8f4700; --ok:#2a6224; --accent:#ee0000; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink);
+         font-family:"Red Hat Text",-apple-system,"Segoe UI",Helvetica,Arial,sans-serif; font-size:14px; }
+  .wrap { max-width:1180px; margin:0 auto; padding:36px 32px 48px; }
+  .top { border-bottom:3px solid var(--accent); padding-bottom:16px; }
+  .toprow { display:flex; justify-content:space-between; align-items:flex-start; gap:16px; }
+  h1 { font-family:"Red Hat Display",-apple-system,Helvetica,Arial,sans-serif; font-size:28px; margin:0; }
+  .gen { font-size:13px; color:var(--muted); margin-top:6px; }
+  .kpis { display:grid; grid-template-columns:repeat(5,1fr); gap:14px; margin:24px 0; }
+  .kpi { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:16px 18px; }
+  .kpi .k { font-size:13px; color:var(--muted); font-weight:600; }
+  .kpi .v { font-size:30px; font-weight:700; margin-top:4px; font-variant-numeric:tabular-nums; }
+  .kpi .d { font-size:12px; color:var(--muted); margin-top:2px; }
+  .red { color:var(--bad); } .amber { color:var(--warn); } .green { color:var(--ok); }
+  .panel { background:var(--card); border:1px solid var(--line); border-radius:10px;
+           padding:18px 22px; margin-bottom:16px; }
+  h2 { font-size:16px; margin:0; }
+  .sub { font-size:12px; color:var(--muted); margin-top:4px; }
+  table { width:100%; border-collapse:collapse; margin-top:12px; }
+  th { text-align:left; font-size:12px; color:var(--muted); padding:7px 10px; border-bottom:1px solid var(--line); }
+  td { padding:9px 10px; border-bottom:1px solid var(--line); font-variant-numeric:tabular-nums; }
+  th.n, td.n { text-align:right; }
+  tr:last-child td { border-bottom:0; }
+  .chip { font-size:12px; font-weight:700; padding:4px 11px; border-radius:999px; white-space:nowrap; }
+  .chip.ok { background:#e6f2e3; color:var(--ok); }
+  .chip.bad { background:#fbe7e5; color:var(--bad); }
+  .chip.warn { background:#fdefdc; color:var(--warn); }
+  .chip.none { background:#eef0f2; color:var(--muted); }
+  .pdf { font:inherit; font-size:13px; font-weight:600; color:var(--ink); background:var(--card);
+         border:1px solid #c7c9cc; border-radius:8px; padding:8px 16px; cursor:pointer; white-space:nowrap; }
+  .pdf:hover { background:#eef0f2; }
+  .keycard { display:flex; border:1px solid var(--line); border-radius:10px; background:var(--card); overflow:hidden; }
+  .keycard div { flex:1; padding:14px 16px; border-right:1px solid var(--line); }
+  .keycard div:last-child { border-right:0; }
+  .keycard p { margin:8px 0 0; font-size:12.5px; color:var(--muted); line-height:1.45; }
+  .note { margin-top:10px; font-size:12px; color:var(--muted); }
+  @media print {
+    @page { size: landscape; margin: 10mm; }
+    * { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+    body { background:#fff; }
+    .wrap { max-width:none; padding:0; }
+    .pdf { display:none; }
+    .kpi, .panel, .keycard, tr { break-inside: avoid; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="top">
+    <div class="toprow">
+      <h1>{{ lightspeed_report_title | e }}</h1>
+      {# Opens the browser's print dialog; choose "Save as PDF". #}
+      <button class="pdf" type="button" onclick="window.print()">Download PDF</button>
+    </div>
+    <div class="gen">Generated {{ lightspeed_report_generated }} &middot; hosts and vulnerabilities from Red Hat Lightspeed</div>
+  </div>
+
+  <div class="kpis">
+    <div class="kpi"><div class="k">Servers</div><div class="v">{{ rows | length }}</div>
+      <div class="d">registered with Lightspeed</div></div>
+    <div class="kpi"><div class="k">Critical CVEs</div>
+      <div class="v {{ 'red' if ns.critical > 0 else 'green' }}">{{ ns.critical }}</div>
+      <div class="d">across all servers</div></div>
+    <div class="kpi"><div class="k">Important CVEs</div>
+      <div class="v {{ 'amber' if ns.important > 0 else 'green' }}">{{ ns.important }}</div>
+      <div class="d">across all servers</div></div>
+    <div class="kpi"><div class="k">Known exploits</div>
+      <div class="v {{ 'red' if ns.exploit > 0 else 'green' }}">{{ ns.exploit }}</div>
+      <div class="d">CVEs actively exploited</div></div>
+    <div class="kpi"><div class="k">Servers at risk</div>
+      <div class="v {{ 'red' if ns.at_risk > 0 else 'green' }}">{{ ns.at_risk }}</div>
+      <div class="d">with a critical CVE or known exploit</div></div>
+  </div>
+
+  <div class="panel">
+    <h2>Servers and their vulnerabilities</h2>
+    <div class="sub">One row per server. Counts come from the Red Hat Lightspeed vulnerability service.</div>
+    <table>
+      <tr><th>Server</th><th>OS</th><th>Last check-in</th>
+        <th class="n">Critical</th><th class="n">Important</th><th class="n">Known exploit</th>
+        <th class="n">With a fix</th><th>Status</th></tr>
+{% for r in rows %}
+      <tr>
+        <td><b>{{ r.host | e }}</b></td>
+        <td>{{ r.os | e }}</td>
+        <td>{{ r.last_upload | e }}</td>
+{% if r.found %}
+        <td class="n {{ 'red' if r.critical > 0 }}">{{ r.critical }}</td>
+        <td class="n {{ 'amber' if r.important > 0 }}">{{ r.important }}</td>
+        <td class="n {{ 'red' if r.known_exploit > 0 }}">{{ r.known_exploit }}</td>
+        <td class="n">{{ r.fixable }}</td>
+        <td>
+{%   if r.critical > 0 or r.known_exploit > 0 %}<span class="chip bad">Patch now</span>
+{%   elif r.important > 0 %}<span class="chip warn">Next window</span>
+{%   else %}<span class="chip ok">No urgent CVEs</span>{% endif %}
+        </td>
+{% else %}
+        <td class="n">&ndash;</td><td class="n">&ndash;</td><td class="n">&ndash;</td><td class="n">&ndash;</td>
+        <td><span class="chip none">No vulnerability data</span></td>
+{% endif %}
+      </tr>
+{% endfor %}
+    </table>
+  </div>
+
+  {# Status key: one card per badge used in the table above. #}
+  <div class="keycard">
+    <div><span class="chip bad">Patch now</span><p>At least one critical CVE or a known exploit. Act first.</p></div>
+    <div><span class="chip warn">Next window</span><p>Important CVEs only. Patch in the next maintenance window.</p></div>
+    <div><span class="chip ok">No urgent CVEs</span><p>No critical, important or known-exploit CVEs.</p></div>
+    <div><span class="chip none">No vulnerability data</span><p>Not yet evaluated by Lightspeed. Listed, never counted as safe.</p></div>
+  </div>
+{% if no_data %}
+  <div class="note">{{ no_data | length }} server(s) had no vulnerability data from Lightspeed.</div>
+{% endif %}
+</div>
+</body>
+</html>
