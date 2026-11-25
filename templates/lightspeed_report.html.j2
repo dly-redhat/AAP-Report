@@ -1,6 +1,12 @@
 <!DOCTYPE html>
-{# Rows come from lightspeed_report.yml: one per host in the Lightspeed inventory. #}
-{% set rows = lightspeed_report_rows | sort(attribute='host') %}
+{% set clean = [] %}
+{% for r in lightspeed_report_rows %}
+{%   set _ = clean.append({'host': r.host | string, 'os': r.os | string,
+       'last_upload': r.last_upload | string, 'found': r.found | bool,
+       'critical': r.critical | int, 'important': r.important | int,
+       'known_exploit': r.known_exploit | int, 'fixable': r.fixable | int}) %}
+{% endfor %}
+{% set rows = clean | sort(attribute='host') %}
 {% set with_data = rows | selectattr('found') | list %}
 {% set no_data = rows | rejectattr('found') | list %}
 {% set ns = namespace(critical=0, important=0, exploit=0, fixable=0, at_risk=0) %}
