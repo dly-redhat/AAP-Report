@@ -10,10 +10,19 @@
     # container, so set an inventory host with a web server for real use.
     lightspeed_report_host: localhost
     lightspeed_report_dest: /tmp/lightspeed_report.html
+    # File permissions. 0640 = owner and group only (the report lists exposed servers).
+    # For a web server, set the group the web server runs as (apache on RHEL)
+    # and become: true so the file can be written under /var/www/html.
+    lightspeed_report_mode: "0640"
+    lightspeed_report_group: ""
+    lightspeed_report_become: false
     # Lightspeed endpoints and limits; normally left alone.
     lightspeed_report_sso_url: https://sso.redhat.com/auth/realms/redhat-external/protocol/openid-connect/token
     lightspeed_report_api: https://console.redhat.com/api/vulnerability/v1
+    lightspeed_report_inventory_api: https://console.redhat.com/api/inventory/v1
     lightspeed_report_timeout: 90
+    # HTTP results worth retrying: -1 = timed out or unreachable, 5xx = server error.
+    lightspeed_report_retry_statuses: [-1, 429, 500, 502, 503, 504]
     lightspeed_report_client_id: "{{ lookup('ansible.builtin.env', 'INSIGHTS_CLIENT_ID') }}"
     lightspeed_report_client_secret: "{{ lookup('ansible.builtin.env', 'INSIGHTS_CLIENT_SECRET') }}"
     # One count per host for each of these CVE filters.
@@ -21,7 +30,6 @@
       - { name: critical, query: 'impact=7' }
       - { name: important, query: 'impact=5' }
       - { name: known_exploit, query: 'known_exploit=true' }
-      - { name: fixable, query: 'advisory_available=true' }
 
   tasks:
     - name: Check the inputs before calling Lightspeed
@@ -47,22 +55,60 @@
         timeout: "{{ lightspeed_report_timeout }}"
       register: lightspeed_report_token
       no_log: true
+      # no_log hides this result, so the next task reports the outcome safely.
+      failed_when: false
+      retries: 3
+      delay: 10
+      until: lightspeed_report_token.status | default(-1) not in lightspeed_report_retry_statuses
 
-    - name: Get each host's OS and last upload time
+    - name: Stop with the reason if no token was issued (secret not shown)
+      ansible.builtin.assert:
+        that:
+          - lightspeed_report_token.status | default(-1) == 200
+        fail_msg: >-
+          {{ 'sso.redhat.com did not answer (timed out or unreachable): run the job again.'
+             if lightspeed_report_token.status | default(-1) == -1
+             else 'sso.redhat.com refused the token request (HTTP ' ~ lightspeed_report_token.status
+                  ~ '): check the client ID and secret in the job credential.' }}
+
+    - name: Get each host's OS from the Lightspeed inventory
       ansible.builtin.uri:
-        url: "{{ lightspeed_report_api }}/systems/{{ hostvars[item].insights_id }}"
+        url: >-
+          {{ lightspeed_report_inventory_api }}/hosts/{{ hostvars[item].insights_id
+          }}/system_profile?fields[system_profile]=operating_system
         headers:
           Authorization: "Bearer {{ lightspeed_report_token.json.access_token }}"
         timeout: "{{ lightspeed_report_timeout }}"
-        # 404 = Lightspeed knows the host but has no vulnerability data for it.
-        status_code: [200, 404]
+      loop: "{{ lightspeed_report_hosts }}"
+      loop_control:
+        label: "{{ item }}"
+      register: lightspeed_report_profiles
+      # The OS is a nice-to-have: a failure here shows "unknown", it never stops the report.
+      failed_when: false
+      retries: 3
+      delay: 10
+      until: lightspeed_report_profiles.status | default(-1) not in lightspeed_report_retry_statuses
+      when: hostvars[item].insights_id is defined
+
+    # Same lookup as auto-lab's security_facts role: find the host by name in the
+    # vulnerability service and read its record (fixable CVE count, last upload).
+    - name: Find each host in the vulnerability service
+      ansible.builtin.uri:
+        url: >-
+          {{ lightspeed_report_api }}/systems?filter={{
+          hostvars[item].insights_display_name | default(item) | urlencode }}
+        headers:
+          Authorization: "Bearer {{ lightspeed_report_token.json.access_token }}"
+        timeout: "{{ lightspeed_report_timeout }}"
       loop: "{{ lightspeed_report_hosts }}"
       loop_control:
         label: "{{ item }}"
       register: lightspeed_report_systems
+      # Retry only timeouts and server errors; a 401/403 will never succeed.
       retries: 3
       delay: 10
-      until: lightspeed_report_systems is succeeded
+      until: lightspeed_report_systems.status | default(-1) not in lightspeed_report_retry_statuses
+      failed_when: false
       when: hostvars[item].insights_id is defined
 
     - name: Count CVEs per host by severity and exploit status
@@ -78,10 +124,28 @@
       loop_control:
         label: "{{ item.0 }} {{ item.1.name }}"
       register: lightspeed_report_counts
+      # Retry only timeouts and server errors; a 401/403 will never succeed.
       retries: 3
       delay: 10
-      until: lightspeed_report_counts is succeeded
+      until: lightspeed_report_counts.status | default(-1) not in lightspeed_report_retry_statuses
+      failed_when: false
       when: hostvars[item.0].insights_id is defined
+
+    - name: Stop with the reason if Lightspeed refused or failed the lookups
+      ansible.builtin.assert:
+        that:
+          - lightspeed_report_bad | length == 0
+        fail_msg: >-
+          {{ lightspeed_report_bad | length }} Lightspeed lookups failed, first with HTTP
+          {{ (lightspeed_report_bad | first).status | default('none') }}.
+          {{ 'The service account lacks the Vulnerability viewer role (User Access in console.redhat.com).'
+             if (lightspeed_report_bad | first).status | default(0) in [401, 403]
+             else 'Lightspeed timed out or had an error: run the job again.' }}
+      vars:
+        lightspeed_report_bad: >-
+          {{ (lightspeed_report_systems.results + lightspeed_report_counts.results)
+             | selectattr('status', 'defined')
+             | rejectattr('status', 'in', [200, 404]) | list }}
 
     - name: Build one report row per host
       ansible.builtin.set_fact:
@@ -90,8 +154,16 @@
       loop_control:
         label: "{{ item.item }}"
       vars:
-        found: "{{ item.status | default(0) == 200 }}"
-        attrs: "{{ item.json.data.attributes | default({}) if found else {} }}"
+        display_name: "{{ hostvars[item.item].insights_display_name | default(item.item) }}"
+        # Keep only the exact name match (the filter also matches partial names).
+        match: >-
+          {{ (item.json.data | default([]) if item.status | default(0) == 200 else [])
+             | selectattr('attributes.display_name', 'equalto', display_name) | list }}
+        attrs: "{{ match[0].attributes if match | length == 1 else {} }}"
+        profile: >-
+          {{ (lightspeed_report_profiles.results | selectattr('item', 'equalto', item.item) | first).json.results
+             | default([{}]) | first | default({}) }}
+        osinfo: "{{ profile.system_profile.operating_system | default({}) }}"
         counts: >-
           {{ dict(lightspeed_report_counts.results
                   | selectattr('item.0', 'equalto', item.item)
@@ -105,20 +177,22 @@
                         | map(attribute='json.meta.total_items'))) }}
         row:
           host: "{{ item.item }}"
-          found: "{{ found }}"
-          os: "{{ attrs.os | default('unknown') }}"
+          found: "{{ match | length == 1 }}"
+          os: >-
+            {{ (osinfo.name ~ ' ' ~ osinfo.major ~ '.' ~ osinfo.minor) if osinfo.name is defined else 'unknown' }}
           last_upload: "{{ (attrs.last_upload | default(''))[:10] }}"
           critical: "{{ counts.critical | default(0) | int }}"
           important: "{{ counts.important | default(0) | int }}"
           known_exploit: "{{ counts.known_exploit | default(0) | int }}"
-          fixable: "{{ counts.fixable | default(0) | int }}"
+          # Lightspeed's cve_count = CVEs with a fix available (same as auto-lab's check).
+          fixable: "{{ attrs.cve_count | default(0) | int }}"
 
     - name: Show each host in the job output
       ansible.builtin.debug:
         msg: >-
           {{ item.host }} ({{ item.os }}): {{ item.critical }} critical,
           {{ item.important }} important, {{ item.known_exploit }} known exploit,
-          {{ item.fixable }} with a fix{{ '' if item.found else ' - no vulnerability data' }}
+          {{ item.fixable }} with a fix{{ '' if item.found | bool else ' - no vulnerability data' }}
       loop: "{{ lightspeed_report_rows }}"
       loop_control:
         label: "{{ item.host }}"
@@ -127,8 +201,10 @@
       ansible.builtin.template:
         src: templates/lightspeed_report.html.j2
         dest: "{{ lightspeed_report_dest }}"
-        mode: "0644"
+        mode: "{{ lightspeed_report_mode }}"
+        group: "{{ lightspeed_report_group if lightspeed_report_group | length > 0 else omit }}"
       delegate_to: "{{ lightspeed_report_host }}"
+      become: "{{ lightspeed_report_become | bool }}"
       vars:
         lightspeed_report_generated: "{{ now(utc=true, fmt='%Y-%m-%d %H:%M UTC') }}"
 
